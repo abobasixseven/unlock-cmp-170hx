@@ -1,3 +1,5 @@
+# M-Technics ПРИДЕТСЯ ИЗВИНИТЬСЯ
+
 # NVIDIA CMP 170HX Unlock Guide
 
 > **Research in progress.** Document reflects current findings as of July 2026.  
