@@ -604,9 +604,11 @@ sudo python3 /home/aboba67/cmpunlocker/probe_170hx.py
 # [0x009A0204] FBPA_CFG1           = 0x02779000 ✅ UNLOCKED (64GB)
 # [0x00100CE0] LMR                 = 0x0000020B ✅ UNLOCKED
 
-
-**Expected nvidia-smi output:**
 ```
+
+```
+Expected nvidia-smi output:
+
 +-----------------------------------------------------------------------------+
 | NVIDIA-SMI 580.173.02   Driver Version: 580.173.02   CUDA Version: 12.8     |
 |-------------------------------+----------------------+----------------------+
