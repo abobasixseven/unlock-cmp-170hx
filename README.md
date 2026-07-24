@@ -904,6 +904,7 @@ If something doesn't work:
 - Driver 610.43.03 (not 580, not 595)
 - Secure Boot must be disabled
 
+
 ═══════════════════════════════════════════════════════════════════════════
 
 EXECUTE STEP BY STEP: 5 (preparation) → 6 (installation) → 6.5 (cold reboot)
@@ -914,3 +915,374 @@ MAIN GOAL: nvidia-smi shows 65536 MiB, CUDA works,
 registers ALL UNLOCKED.
 
 ═══════════════════════════════════════════════════════════════════════════
+
+# 14. PCIe Gen1 → Gen2 Unlock (Optional)
+
+### Overview
+
+The CMP 170HX ships with PCIe locked to **Gen1 (2.5 GT/s)** — an artificial cap that limits host↔GPU bandwidth to ~1 GB/s. This is independent from the compute and VRAM locks covered in earlier sections.
+
+A community patch (`0007-pcie-gen2.patch` from the [bendy2/cmpunlocker](https://github.com/bendy2/cmpunlocker/tree/combined-multiple-cards-gen2) fork) raises the link to **Gen2 (5.0 GT/s)**, doubling bandwidth to ~2 GB/s — purely in software, no hardware modification required.
+
+| Property | Before | After |
+|----------|--------|-------|
+| PCIe Link Speed | Gen1 (2.5 GT/s) | Gen2 (5.0 GT/s) |
+| Bandwidth (x4) | ~1 GB/s | ~2 GB/s |
+| Bandwidth (x16 with solder mod) | ~4 GB/s | ~8 GB/s |
+| Method | — | In-driver patch (SEC2 Booter + BAR0) |
+| Hardware mod required | — | No |
+
+> **Note:** Gen2 is the software ceiling. Gen3/Gen4 are blocked by an OTP silicon fuse (`FUSE_PCIE_GEN23_DIS = 0x1`) that cannot be bypassed in software. Gen2 bypasses the fuse-gated SerDes by using register-level overrides that re-enable Gen2 signaling without touching the fuse itself.
+
+---
+
+### How It Works
+
+The Gen1 cap is enforced by multiple gates. The patch defeats them through a **combined sequence** of SEC2 Booter writes (for PLM-protected registers) and BAR0 writes (for standard registers), executed **before** GSP-RM boot — same mechanism as the main compute/VRAM unlock.
+
+#### Gates bypassed by the patch:
+
+| Gate | Register | Mechanism | How patch defeats it |
+|------|----------|-----------|---------------------|
+| XP3G PHY PLM | `0x8E1B0–0x8E1BC` | PLM-locked, blocks PHY rate config | Opened via SEC2 Booter → `0xFFFFFFFF` |
+| XVE config PLM | `0x88FE8–0x88FF0` | PLM-locked, blocks XVE overrides | Opened via SEC2 Booter → `0xFFFFFFFF` |
+| OPT_GEN23 disable | `0x82057C` | `0x1` = Gen2/3 disabled (fuse shadow) | Written to `0x0` via SEC2 Booter |
+| FEAT_OVR ECC PLM | `0x823800` | PLM-locked | Opened via SEC2 Booter → `0xFFFFFFFF` |
+| OPTB fuse shadows | `0x8200D0–0x8200F4` | PLM-locked | Opened via SEC2 Booter → `0xFFFFFFFF` |
+| CYA_0 Gen2 disable | `0x8C2C0` bit 2 | `DIS_G2` bit set | Cleared via BAR0 |
+| LINK_CONFIG_0 max rate | `0x8C040` bits [19:18] | Max rate = Gen1 | Set to `0x2` (Gen2) via BAR0 |
+| LINK_CTRL_2 target speed | `0x880A8` bits [3:0] | Target = Gen1 | Set to `0x2` (Gen2) via BAR0 |
+| PRIV_MISC_1 Gen2 enable | `0x8841C` bits 11–14 | Gen2 disabled | Bits 11,13 set; bits 12,14 cleared via Booter + late BAR0 |
+| PL_LINK_RATE | `0x8C1C0` | Gen1 rate | Set to `0x00240036` (Gen2) via BAR0 |
+| VSEC_HIERARCHY | `0x88610` bit 12 | Gates PRIV_MISC_1 reprogram | Bit 12 cleared, bit 0 set via BAR0 |
+| VSEC_DEVICE | `0x8860C` bit 0 | Device gate | Bit 0 set via Booter |
+| LTSSM retrain | `0x8872C` | — | Triggered with `0x6` (retrain) via BAR0 |
+
+The patch also includes a **late retrain** in `kernel_gsp_tu102.c` — after GSP-RM boot completes, it re-applies the Gen2 register settings and retrains the link again. This ensures GSP-RM doesn't override the Gen2 configuration during its own initialization.
+
+#### Why earlier research failed
+
+The [170th-street research](https://170th-street.gitbook.io/hx/) tested registers **individually** and concluded all paths were closed. The patch succeeds because it:
+
+1. Opens **22 PLM-protected registers** in a single combined sequence (not one at a time)
+2. Clears the `DIS_G2` bit in `CYA_0` (a register not covered in earlier research)
+3. Sets `MAX_RATE=2` in `LINK_CONFIG_0` (another register not covered)
+4. Applies settings **twice**: once pre-GSP (via Booter) and once post-GSP (late retrain)
+5. Uses the SEC2 Booter's CSB write path to reach registers that host BAR0 writes cannot touch
+
+---
+
+### Installation
+
+#### Prerequisites
+
+- Working cmpunlocker installation (Section 9) — compute + VRAM unlock must be active
+- Driver 610.43.03 patched with patches 0001–0006 from amoghmunikote/cmpunlocker
+- CMP 170HX with PCI Device ID `0x20C2` or `0x2082`
+- Cold reboot capability (physical power cycle)
+
+#### Option A: Fresh install with bendy2 fork (recommended)
+
+The [bendy2/cmpunlocker](https://github.com/bendy2/cmpunlocker/tree/combined-multiple-cards-gen2) fork includes all 7 patches (original 6 + Gen2). It also adds multi-card support.
+
+```bash
+# Remove existing cmpunlocker installation
+cd /home/g/cmpunlocker-amogh  # or wherever your current install is
+sudo ./remove.sh --yes 2>/dev/null || true
+
+# Clone the bendy2 fork with Gen2 branch
+cd /home/g
+git clone -b combined-multiple-cards-gen2 \
+    https://github.com/bendy2/cmpunlocker.git cmpunlocker-gen2
+
+# Install (same profile as before)
+cd cmpunlocker-gen2
+sudo ./install.sh --profile=8gb
+
+# Cold reboot (MANDATORY)
+sudo systemctl poweroff
+# Unplug power cable for 60 seconds
+# Plug back in and boot
+```
+
+#### Option B: Add Gen2 patch to existing installation
+
+If you already have amoghmunikote/cmpunlocker installed and want to add Gen2:
+
+```bash
+# Download the Gen2 patch
+cd /home/g/cmpunlocker-amogh/driver/patches/
+wget -O 0007-pcie-gen2.patch \
+    https://raw.githubusercontent.com/bendy2/cmpunlocker/combined-multiple-cards-gen2/driver/patches/0007-pcie-gen2.patch
+
+# Verify the patch downloaded correctly
+head -5 0007-pcie-gen2.patch
+# Should show: --- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+
+# Rebuild and reinstall
+cd /home/g/cmpunlocker-amogh
+sudo ./install.sh --profile=8gb
+
+# Cold reboot (MANDATORY)
+sudo systemctl poweroff
+# Unplug power cable for 60 seconds
+# Plug back in and boot
+```
+
+> **Important:** The `install.sh` script downloads fresh source from NVIDIA's GitHub and applies all patches in `driver/patches/` in numerical order. Adding `0007-pcie-gen2.patch` to the patches directory is sufficient — it will be applied automatically after patches 0001–0006.
+
+---
+
+### Verification
+
+After cold reboot, verify the PCIe link speed:
+
+#### Check PCIe link speed via lspci
+
+```bash
+sudo lspci -d 10de:20c2 -vv | grep -E "LnkCap:|LnkSta:"
+```
+
+Expected output (Gen2):
+```
+LnkCap:  Port #0, Speed 5GT/s, Width x4    ← Capability shows 5GT/s
+LnkSta:  Speed 5GT/s, Width x4             ← Current link is 5GT/s (Gen2)
+```
+
+If you still see `Speed 2.5GT/s`, the patch did not take effect — check dmesg (below).
+
+#### Check via nvidia-smi
+
+```bash
+nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.gen.max --format=csv
+```
+
+Expected output:
+```
+2, 2
+```
+
+- `current = 2` means link is operating at Gen2
+- `max = 2` means Gen2 is the maximum supported
+
+If output shows `1, 1`, the patch did not take effect.
+
+#### Check dmesg for SEC2_DEBUG PCIe logs
+
+```bash
+sudo dmesg | grep "SEC2_DEBUG.*PCIe" | head -40
+```
+
+Expected output (key lines):
+```
+SEC2_DEBUG: PCIe pre  CAP=0x... CAP2=0x... ... speed=1
+SEC2_DEBUG: PCIe xp3g booter XP3G_PLM(0x8e1b0)=0xffffffff ... status=0x0
+SEC2_DEBUG: PCIe xp3g booter OPT_GEN23(0x82057c)=0x00000000 ... status=0x0
+SEC2_DEBUG: PCIe xp3g booter PRIV_MISC_1(0x8841c)=0x... ... status=0x0
+SEC2_DEBUG: PCIe CYA_0 after clear DIS_G2: 0x... (bit2=0)
+SEC2_DEBUG: PCIe LINK_CONFIG_0 after MAX_RATE=2: 0x...
+SEC2_DEBUG: PCIe retrain done ... speed=2
+SEC2_DEBUG: PCIe PRIV_MISC_1 late pre=0x... post=0x...
+SEC2_DEBUG: PCIe XVE_OVR late=0x00000006
+```
+
+Key indicators of success:
+- `OPT_GEN23` = `0x00000000` (was `0x1`)
+- `DIS_G2` bit2 = `0` (was `1`)
+- `speed=2` in retrain done line
+- No `FAILED to set` messages
+
+#### Bandwidth test
+
+```bash
+# Simple bandwidth test using CUDA
+python3 -c "
+import ctypes
+import time
+
+lib = ctypes.CDLL('libcuda.so.1')
+lib.cuInit(0)
+
+# Get device
+dev = ctypes.c_int()
+lib.cuDeviceGet(ctypes.byref(dev), 0)
+
+# Allocate host and device buffers
+size = 256 * 1024 * 1024  # 256 MB
+host_buf = (ctypes.c_char * size)()
+dev_buf = ctypes.c_void_p()
+
+lib.cuMemAlloc(ctypes.byref(dev_buf), size)
+
+# Warm up
+lib.cuMemcpyHtoD(dev_buf, host_buf, size)
+lib.cuDeviceSynchronize()
+
+# Time multiple transfers
+import time
+n = 20
+t0 = time.time()
+for _ in range(n):
+    lib.cuMemcpyHtoD(dev_buf, host_buf, size)
+lib.cuDeviceSynchronize()
+t1 = time.time()
+
+bandwidth = n * size / (t1 - t0) / (1024**3)
+print(f'H2D bandwidth: {bandwidth:.2f} GB/s')
+print(f'Expected Gen1 x4: ~0.9 GB/s')
+print(f'Expected Gen2 x4: ~1.8 GB/s')
+
+lib.cuMemFree(dev_buf)
+"
+```
+
+---
+
+### Expected Results
+
+| Metric | Gen1 x4 (before) | Gen2 x4 (after) | Improvement |
+|--------|-------------------|------------------|-------------|
+| Link speed | 2.5 GT/s | 5.0 GT/s | 2× |
+| H2D bandwidth | ~0.9 GB/s | ~1.8 GB/s | 2× |
+| D2H bandwidth | ~0.9 GB/s | ~1.8 GB/s | 2× |
+| Model loading (70B) | ~70 sec | ~35 sec | 2× faster |
+| CUDA kernel launch | ~50 µs | ~35 µs | ~1.4× faster |
+
+#### With x16 solder mod (24 capacitors)
+
+| Metric | Gen1 x4 (stock) | Gen2 x16 (Gen2 patch + solder) | Improvement |
+|--------|------------------|--------------------------------|-------------|
+| Link speed | 2.5 GT/s | 5.0 GT/s | 2× |
+| Link width | x4 | x16 | 4× |
+| H2D bandwidth | ~0.9 GB/s | ~7.5 GB/s | **8×** |
+| D2H bandwidth | ~0.9 GB/s | ~7.5 GB/s | **8×** |
+| Model loading (70B) | ~70 sec | ~9 sec | **8× faster** |
+
+---
+
+### Troubleshooting
+
+#### Link stays at Gen1 after patch
+
+```bash
+# 1. Check if patch was applied during build
+strings /lib/modules/$(uname -r)/updates/cmpunlocker/nvidia.ko | grep "PCIe pre"
+# Should show: SEC2_DEBUG: PCIe pre  CAP=
+# If empty — patch was not applied, rebuild
+
+# 2. Check dmesg for errors
+sudo dmesg | grep "SEC2_DEBUG.*PCIe.*FAILED" | tail -10
+# If FAILED messages appear — SEC2 Booter could not write to PLM registers
+
+# 3. Check OPT_GEN23 value
+sudo dmesg | grep "OPT_GEN23" | tail -5
+# Should show 0x00000000 after patch
+# If still 0x1 — SEC2 Booter write failed
+
+# 4. Try another cold reboot (sometimes first boot doesn't take)
+sudo systemctl poweroff
+# 60 seconds without power → boot → check again
+```
+
+#### Link trains at Gen2 but drops back to Gen1
+
+This can happen if the host root port or PCIe slot is not Gen2-capable, or if there's signal integrity issues.
+
+```bash
+# Check host root port capability
+sudo lspci -s 00:01.0 -vv | grep LnkCap
+# Should show Speed 5GT/s or higher
+
+# Check for PCIe errors
+sudo dmesg | grep -i "AER\|pcie\|link\|training" | tail -20
+
+# If signal integrity issues — try a different PCIe slot or shorter riser cable
+```
+
+#### nvidia-smi shows gen.current=2 but lspci shows 2.5GT/s
+
+This is a reporting mismatch. Trust `lspci` — it reads the actual hardware link state:
+
+```bash
+# lspci is authoritative
+sudo lspci -d 10de:20c2 -vv | grep LnkSta
+# If LnkSta shows Speed 5GT/s → Gen2 is working
+# If LnkSta shows Speed 2.5GT/s → still Gen1
+```
+
+---
+
+### Limitations
+
+1. **Gen2 is the software ceiling.** Gen3/Gen4 require an OTP fuse (`FUSE_PCIE_GEN23_DIS`) to be cleared, which is a physical silicon modification. No software path exists.
+
+2. **x4 width is not changed by this patch.** The PCIe width (x4 vs x16) is a separate hardware limitation. To get x16, solder 24 × 0402 0.22µF AC-coupling capacitors (C1100–C1350) on the PCB.
+
+3. **Host root port must support Gen2.** Most modern motherboards (AMD Raphael/Genoa, Intel 12th gen+) support Gen2 natively. If the host only supports Gen1, the link will stay at Gen1 regardless of the GPU's capability.
+
+4. **PCIe riser cables.** Some cheap riser cables are Gen1-only. Use a Gen2 or Gen4 rated riser if testing with a riser.
+
+5. **Stability.** Gen2 at x4 is well within GA100's native capabilities. No stability issues expected. If instability occurs, check signal integrity (riser, slot, board).
+
+---
+
+### Comparison with 170th-street research
+
+The [170th-street PCIe field manual](https://170th-street.gitbook.io/hx/) concluded that PCIe Gen1 was an unbreakable hardware wall. Their research was thorough and correct about Gen3/Gen4 being fuse-locked. However, they missed the Gen2 path because:
+
+| What 170th-street tested | What the patch does differently |
+|---------------------------|--------------------------------|
+| Individual register writes (one at a time) | Combined 22-register sequence in one pass |
+| Did not clear `CYA_0` bit 2 (`DIS_G2`) | Clears `DIS_G2` — critical Gen2 enable bit |
+| Did not set `LINK_CONFIG_0` `MAX_RATE=2` | Sets `MAX_RATE=2` — programs Gen2 as maximum |
+| Tested host BAR0 writes only | Uses SEC2 Booter CSB path for PLM-protected registers |
+| No late retrain after GSP-RM boot | Re-applies Gen2 settings post-GSP and retrains |
+| Concluded `OPT_GEN23` is hard RO | SEC2 Booter successfully writes `0x0` to `OPT_GEN23` |
+
+The key insight: **Gen2 does not require clearing the OTP fuse.** The fuse (`FUSE_PCIE_GEN23_DIS`) gates Gen3 SerDes, but Gen2 can be enabled through register overrides (`CYA_0`, `OPT_GEN23`, `PRIV_MISC_1`) that are upstream of the fuse gate. The patch exploits this by opening the PLM on all relevant registers via SEC2 Booter, then programming Gen2 configuration before GSP-RM boot.
+
+---
+
+### Technical Reference: All Registers Modified by Patch 0007
+
+#### SEC2 Booter writes (PLM-protected, via `kgspExecuteBooterLoad_HAL`):
+
+| Address | Name | Value | Purpose |
+|---------|------|-------|---------|
+| `0x0008E1B0` | XP3G_PLM | `0xFFFFFFFF` | Open PHY PLM |
+| `0x0008E1B4` | XP3G_PLM4 | `0xFFFFFFFF` | Open PHY PLM |
+| `0x0008E1B8` | XP3G_PLM8 | `0xFFFFFFFF` | Open PHY PLM |
+| `0x0008E1BC` | XP3G_PLMC | `0xFFFFFFFF` | Open PHY PLM |
+| `0x00088FE8` | XVE_D0 | `0xFFFFFFFF` | Open XVE config PLM |
+| `0x00088FEC` | XVE_D4 | `0xFFFFFFFF` | Open XVE config PLM |
+| `0x00088FF0` | XVE_D8 | `0xFFFFFFFF` | Open XVE config PLM |
+| `0x008200D0`–`0x008200F4` | OPTB_D0–F4 (9 regs) | `0xFFFFFFFF` | Open OPTB fuse shadow PLM |
+| `0x00823800` | FEAT_OVR_ECC_PLM | `0xFFFFFFFF` | Open FEAT_OVR ECC PLM |
+| `0x0082057C` | OPT_GEN23 | `0x00000000` | Clear Gen2/3 disable (was `0x1`) |
+| `0x0008E120` | XP3G_VAL0 | `0x00000000` | PHY rate override value 0 |
+| `0x0008E110` | XP3G_OVR0 | `0x00000001` | PHY rate override enable 0 |
+| `0x0008E12C` | XP3G_VAL3 | `0x00200000` | PHY rate override value 3 |
+| `0x0008E11C` | XP3G_OVR3 | `0x00000004` | PHY rate override enable 3 |
+| `0x0008860C` | VSEC_DEVICE | `current \| (1<<0)` | Enable device VSEC |
+| `0x0008841C` | PRIV_MISC_1 | `set bits 11,13; clear bits 12,14` | Gen2 enable |
+
+#### Direct BAR0 writes (host, after Booter PLM-open):
+
+| Address | Name | Value | Purpose |
+|---------|------|-------|---------|
+| `0x00088610` | VSEC_HIERARCHY | `clear bit 12, set bit 0` | Gate PRIV_MISC_1 reprogram |
+| `0x000880A8` | LINK_CTRL_2 | `bits[3:0]=0x2, bits[19:16]=0xF` | Target speed = Gen2 |
+| `0x0008C2C0` | CYA_0 | `clear bit 2` | Clear `DIS_G2` (Gen2 disable) |
+| `0x0008C040` | LINK_CONFIG_0 | `bits[19:18]=0x2` | `MAX_RATE = Gen2` |
+| `0x0008C1C0` | PL_LINK_RATE | `0x00240036` | PHY link rate for Gen2 |
+| `0x0008872C` | LTSSM | `0x00000006` | Trigger link retrain |
+
+#### Late writes (post-GSP-RM boot, in `kernel_gsp_tu102.c`):
+
+| Address | Name | Value | Purpose |
+|---------|------|-------|---------|
+| `0x0008841C` | PRIV_MISC_1 | `set bits 11,13; clear bits 12,14` | Re-apply Gen2 enable |
+| `0x0008C2C0` | CYA_0 | `clear bit 2` | Re-clear `DIS_G2` |
+| `0x0008C040` | LINK_CONFIG_0 | `bits[19:18]=0x2` | Re-set `MAX_RATE = Gen2` |
+| `0x0008872C` | LTSSM | `0x00000006` | Re-trigger link retrain |
+
